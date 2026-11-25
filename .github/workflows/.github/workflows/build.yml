@@ -1,0 +1,613 @@
+name: Build APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Create Android Project Structure
+        run: |
+          mkdir -p app/src/main/java/com/example/macro
+          mkdir -p app/src/main/res/xml
+          mkdir -p app/src/main/res/values
+
+          cat << 'EOF' > settings.gradle.kts
+          rootProject.name = "Macro"
+          include(":app")
+          EOF
+
+          cat << 'EOF' > build.gradle.kts
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+
+          cat << 'EOF' > app/build.gradle.kts
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.example.macro"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.example.macro"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.appcompat:appcompat:1.7.0")
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+
+              <application
+                  android:allowBackup="true"
+                  android:label="Macro"
+                  android:theme="@style/Theme.AppCompat.DayNight.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".OverlayService"
+                      android:enabled="true"
+                      android:exported="false" />
+
+                  <service
+                      android:name=".MacroAccessibilityService"
+                      android:exported="true"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_service_config" />
+                  </service>
+              </application>
+          </manifest>
+          EOF
+
+          cat << 'EOF' > app/src/main/res/xml/accessibility_service_config.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityFlags="flagDefault"
+              android:canPerformGestures="true"
+              android:description="@string/acc_desc"
+              android:notificationTimeout="50"
+              android:settingsActivity="com.example.macro.MainActivity" />
+          EOF
+
+          cat << 'EOF' > app/src/main/res/values/strings.xml
+          <resources>
+              <string name="app_name">Macro</string>
+              <string name="acc_desc">Ekrandaki belirlenen noktalara tıklama göndermek için erişilebilirlik izni.</string>
+          </resources>
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/example/macro/MacroAccessibilityService.kt
+          package com.example.macro
+
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.graphics.Path
+          import android.view.accessibility.AccessibilityEvent
+
+          class MacroAccessibilityService : AccessibilityService() {
+              companion object {
+                  @Volatile
+                  var instance: MacroAccessibilityService? = null
+              }
+
+              override fun onServiceConnected() {
+                  super.onServiceConnected()
+                  instance = this
+              }
+
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+              override fun onInterrupt() { instance = null }
+              override fun onDestroy() {
+                  super.onDestroy()
+                  instance = null
+              }
+
+              fun tapAt(x: Float, y: Float) {
+                  val path = Path().apply { moveTo(x.coerceAtLeast(1f), y.coerceAtLeast(1f)) }
+                  val gesture = GestureDescription.Builder()
+                      .addStroke(GestureDescription.StrokeDescription(path, 0L, 25L))
+                      .build()
+                  dispatchGesture(gesture, null, null)
+              }
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/example/macro/OverlayService.kt
+          package com.example.macro
+
+          import android.annotation.SuppressLint
+          import android.app.Service
+          import android.content.Intent
+          import android.graphics.Color
+          import android.graphics.PixelFormat
+          import android.graphics.drawable.GradientDrawable
+          import android.os.Build
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.WindowManager
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.SeekBar
+          import android.widget.TextView
+          import kotlin.random.Random
+
+          class OverlayService : Service() {
+              private lateinit var windowManager: WindowManager
+              private val handler = Handler(Looper.getMainLooper())
+              private var barView: View? = null
+              private var sizeSlider: SeekBar? = null
+              private var isPlayMode = false
+              private var cps = 14
+              private var selectedNode: MacroNode? = null
+              private val nodes = mutableListOf<MacroNode>()
+
+              private data class MacroNode(
+                  val id: Int,
+                  val view: TextView,
+                  val params: WindowManager.LayoutParams,
+                  var sizePx: Int = 150,
+                  var holding: Boolean = false,
+                  var runnable: Runnable? = null
+              )
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onCreate() {
+                  super.onCreate()
+                  windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
+                  createControlBar()
+                  addMacroNode(260, 500)
+                  addMacroNode(520, 500)
+              }
+
+              private fun overlayType(): Int =
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                  } else {
+                      @Suppress("DEPRECATION")
+                      WindowManager.LayoutParams.TYPE_PHONE
+                  }
+
+              @SuppressLint("ClickableViewAccessibility", "SetTextI18n")
+              private fun createControlBar() {
+                  val container = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setBackgroundColor(Color.parseColor("#E6161B26"))
+                      setPadding(16, 12, 16, 12)
+                  }
+                  val topRow = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                  }
+                  val modeBtn = Button(this).apply {
+                      text = "Düzenle"
+                      textSize = 12f
+                      setBackgroundColor(Color.parseColor("#F59E0B"))
+                      setTextColor(Color.BLACK)
+                  }
+                  val addBtn = Button(this).apply {
+                      text = "+ Tuş"
+                      textSize = 12f
+                      setBackgroundColor(Color.parseColor("#22C55E"))
+                      setTextColor(Color.BLACK)
+                  }
+                  val delBtn = Button(this).apply {
+                      text = "- Sil"
+                      textSize = 12f
+                      setBackgroundColor(Color.parseColor("#EF4444"))
+                      setTextColor(Color.WHITE)
+                  }
+                  val cpsMinus = Button(this).apply { text = "CPS-"; textSize = 11f }
+                  val cpsLabel = TextView(this).apply {
+                      text = " $cps "
+                      setTextColor(Color.WHITE)
+                      textSize = 12f
+                  }
+                  val cpsPlus = Button(this).apply { text = "CPS+"; textSize = 11f }
+                  val closeBtn = Button(this).apply { text = "Kapat"; textSize = 12f }
+
+                  topRow.addView(modeBtn)
+                  topRow.addView(addBtn)
+                  topRow.addView(delBtn)
+                  topRow.addView(cpsMinus)
+                  topRow.addView(cpsLabel)
+                  topRow.addView(cpsPlus)
+                  topRow.addView(closeBtn)
+
+                  val sliderRow = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                  }
+                  val sizeText = TextView(this).apply {
+                      text = "Boyut: "
+                      setTextColor(Color.parseColor("#FDE047"))
+                      textSize = 12f
+                  }
+                  val slider = SeekBar(this).apply {
+                      max = 220
+                      min = 80
+                      progress = 150
+                      layoutParams = LinearLayout.LayoutParams(320, LinearLayout.LayoutParams.WRAP_CONTENT)
+                  }
+                  sizeSlider = slider
+                  sliderRow.addView(sizeText)
+                  sliderRow.addView(slider)
+
+                  container.addView(topRow)
+                  container.addView(sliderRow)
+
+                  val params = WindowManager.LayoutParams(
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      overlayType(),
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                      PixelFormat.TRANSLUCENT
+                  ).apply {
+                      gravity = Gravity.TOP or Gravity.START
+                      x = 20
+                      y = 60
+                  }
+
+                  var barStartX = 0
+                  var barStartY = 0
+                  var touchStartX = 0f
+                  var touchStartY = 0f
+                  container.setOnTouchListener { _, event ->
+                      when (event.action) {
+                          MotionEvent.ACTION_DOWN -> {
+                              barStartX = params.x
+                              barStartY = params.y
+                              touchStartX = event.rawX
+                              touchStartY = event.rawY
+                              true
+                          }
+                          MotionEvent.ACTION_MOVE -> {
+                              params.x = barStartX + (event.rawX - touchStartX).toInt()
+                              params.y = barStartY + (event.rawY - touchStartY).toInt()
+                              windowManager.updateViewLayout(container, params)
+                              true
+                          }
+                          else -> false
+                      }
+                  }
+
+                  modeBtn.setOnClickListener {
+                      isPlayMode = !isPlayMode
+                      stopAllHolding()
+                      if (isPlayMode) {
+                          modeBtn.text = "OYUN"
+                          modeBtn.setBackgroundColor(Color.parseColor("#38BDF8"))
+                          sliderRow.visibility = View.GONE
+                          addBtn.visibility = View.GONE
+                          delBtn.visibility = View.GONE
+                      } else {
+                          modeBtn.text = "Düzenle"
+                          modeBtn.setBackgroundColor(Color.parseColor("#F59E0B"))
+                          sliderRow.visibility = View.VISIBLE
+                          addBtn.visibility = View.VISIBLE
+                          delBtn.visibility = View.VISIBLE
+                      }
+                      refreshNodeStyles()
+                  }
+
+                  addBtn.setOnClickListener {
+                      val offset = nodes.size * 60
+                      addMacroNode(240 + offset, 450 + offset)
+                  }
+
+                  delBtn.setOnClickListener {
+                      val target = selectedNode ?: nodes.lastOrNull() ?: return@setOnClickListener
+                      removeMacroNode(target)
+                  }
+
+                  cpsMinus.setOnClickListener {
+                      cps = (cps - 2).coerceAtLeast(1)
+                      cpsLabel.text = " $cps "
+                  }
+
+                  cpsPlus.setOnClickListener {
+                      cps = (cps + 2).coerceAtMost(40)
+                      cpsLabel.text = " $cps "
+                  }
+
+                  slider.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                      override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                          val node = selectedNode ?: return
+                          node.sizePx = progress
+                          node.params.width = progress
+                          node.params.height = progress
+                          windowManager.updateViewLayout(node.view, node.params)
+                      }
+                      override fun onStartTrackingTouch(seekBar: SeekBar?) {}
+                      override fun onStopTrackingTouch(seekBar: SeekBar?) {}
+                  })
+
+                  closeBtn.setOnClickListener { stopSelf() }
+
+                  barView = container
+                  windowManager.addView(container, params)
+              }
+
+              @SuppressLint("ClickableViewAccessibility")
+              private fun addMacroNode(startX: Int, startY: Int) {
+                  val sizePx = 150
+                  val tv = TextView(this).apply {
+                      gravity = Gravity.CENTER
+                      textSize = 18f
+                      setTextColor(Color.parseColor("#FEF08A"))
+                  }
+                  val params = WindowManager.LayoutParams(
+                      sizePx,
+                      sizePx,
+                      overlayType(),
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                      PixelFormat.TRANSLUCENT
+                  ).apply {
+                      gravity = Gravity.TOP or Gravity.START
+                      x = startX
+                      y = startY
+                  }
+                  val node = MacroNode(id = nodes.size + 1, view = tv, params = params, sizePx = sizePx)
+                  nodes.add(node)
+                  renumberNodes()
+                  selectNode(node)
+
+                  var initX = 0
+                  var initY = 0
+                  var downRawX = 0f
+                  var downRawY = 0f
+
+                  tv.setOnTouchListener { _, event ->
+                      if (!isPlayMode) {
+                          when (event.action) {
+                              MotionEvent.ACTION_DOWN -> {
+                                  selectNode(node)
+                                  initX = node.params.x
+                                  initY = node.params.y
+                                  downRawX = event.rawX
+                                  downRawY = event.rawY
+                                  true
+                              }
+                              MotionEvent.ACTION_MOVE -> {
+                                  node.params.x = initX + (event.rawX - downRawX).toInt()
+                                  node.params.y = initY + (event.rawY - downRawY).toInt()
+                                  windowManager.updateViewLayout(node.view, node.params)
+                                  true
+                              }
+                              else -> false
+                          }
+                      } else {
+                          when (event.action) {
+                              MotionEvent.ACTION_DOWN -> {
+                                  node.holding = true
+                                  applyNodeDrawable(node, firing = true)
+                                  startNodeLoop(node)
+                                  true
+                              }
+                              MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                                  stopNodeLoop(node)
+                                  true
+                              }
+                              else -> false
+                          }
+                      }
+                  }
+
+                  windowManager.addView(tv, params)
+              }
+
+              private fun startNodeLoop(node: MacroNode) {
+                  stopNodeLoop(node)
+                  node.holding = true
+                  applyNodeDrawable(node, firing = true)
+                  val task = object : Runnable {
+                      override fun run() {
+                          if (!node.holding || !isPlayMode) return
+                          val centerX = node.params.x + node.params.width / 2f
+                          val centerY = node.params.y + node.params.height / 2f
+                          MacroAccessibilityService.instance?.tapAt(centerX, centerY)
+                          val baseDelay = 1000.0 / cps.coerceAtLeast(1)
+                          val jitter = Random.nextDouble(-baseDelay * 0.12, baseDelay * 0.12)
+                          val nextDelay = (baseDelay + jitter).toLong().coerceAtLeast(15L)
+                          handler.postDelayed(this, nextDelay)
+                      }
+                  }
+                  node.runnable = task
+                  handler.post(task)
+              }
+
+              private fun stopNodeLoop(node: MacroNode) {
+                  node.holding = false
+                  node.runnable?.let { handler.removeCallbacks(it) }
+                  node.runnable = null
+                  applyNodeDrawable(node, firing = false)
+              }
+
+              private fun stopAllHolding() {
+                  nodes.forEach { stopNodeLoop(it) }
+              }
+
+              private fun removeMacroNode(node: MacroNode) {
+                  stopNodeLoop(node)
+                  try { windowManager.removeView(node.view) } catch (_: Exception) {}
+                  nodes.remove(node)
+                  if (selectedNode == node) selectedNode = nodes.lastOrNull()
+                  renumberNodes()
+                  refreshNodeStyles()
+              }
+
+              private fun selectNode(node: MacroNode) {
+                  selectedNode = node
+                  sizeSlider?.progress = node.sizePx
+                  refreshNodeStyles()
+              }
+
+              private fun renumberNodes() {
+                  nodes.forEachIndexed { index, n -> n.view.text = (index + 1).toString() }
+              }
+
+              private fun refreshNodeStyles() {
+                  nodes.forEach { applyNodeDrawable(it, it.holding) }
+              }
+
+              private fun applyNodeDrawable(node: MacroNode, firing: Boolean) {
+                  val strokeColor = when {
+                      firing -> Color.parseColor("#4ADE80")
+                      !isPlayMode && selectedNode == node -> Color.parseColor("#38BDF8")
+                      else -> Color.parseColor("#FACC15")
+                  }
+                  val fillColor = if (firing) Color.parseColor("#5522C55E") else Color.parseColor("#2E38BDF8")
+                  node.view.background = GradientDrawable().apply {
+                      shape = GradientDrawable.OVAL
+                      setColor(fillColor)
+                      setStroke(5, strokeColor)
+                  }
+              }
+
+              override fun onDestroy() {
+                  super.onDestroy()
+                  stopAllHolding()
+                  nodes.forEach {
+                      try { windowManager.removeView(it.view) } catch (_: Exception) {}
+                  }
+                  nodes.clear()
+                  barView?.let {
+                      try { windowManager.removeView(it) } catch (_: Exception) {}
+                  }
+              }
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/example/macro/MainActivity.kt
+          package com.example.macro
+
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import androidx.appcompat.app.AppCompatActivity
+
+          class MainActivity : AppCompatActivity() {
+              private lateinit var statusTv: TextView
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(40, 80, 40, 40)
+                  }
+                  statusTv = TextView(this).apply {
+                      textSize = 15f
+                      setPadding(0, 0, 0, 30)
+                  }
+                  val overlayBtn = Button(this).apply {
+                      text = "1. Başka Uygulama Üstünde Gösterme İzni Ver"
+                      setOnClickListener {
+                          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                              startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+                          }
+                      }
+                  }
+                  val accBtn = Button(this).apply {
+                      text = "2. Erişilebilirlik (Tıklama) İzni Aç"
+                      setOnClickListener {
+                          startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                      }
+                  }
+                  val startOverlayBtn = Button(this).apply {
+                      text = "3. Ana Ekrana / Oyuna Tuşları Gönder"
+                      setOnClickListener {
+                          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this@MainActivity)) {
+                              statusTv.text = "Önce 1. adımdan üstte gösterme iznini ver."
+                              return@setOnClickListener
+                          }
+                          startService(Intent(this@MainActivity, OverlayService::class.java))
+                          startActivity(Intent(Intent.ACTION_MAIN).apply {
+                              addCategory(Intent.CATEGORY_HOME)
+                              flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                          })
+                      }
+                  }
+                  root.addView(statusTv)
+                  root.addView(overlayBtn)
+                  root.addView(accBtn)
+                  root.addView(startOverlayBtn)
+                  setContentView(root)
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  val canOverlay = Build.VERSION.SDK_INT < Build.VERSION_CODES.M || Settings.canDrawOverlays(this)
+                  val accActive = MacroAccessibilityService.instance != null
+                  statusTv.text = "Üstte Gösterme İzni: ${if (canOverlay) "AÇIK" else "KAPALI"}\n" +
+                          "Erişilebilirlik (Tıklama) İzni: ${if (accActive) "AÇIK" else "KAPALI"}"
+              }
+          }
+          EOF
+
+          ./gradlew assembleDebug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Macro-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
